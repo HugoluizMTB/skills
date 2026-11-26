@@ -7,7 +7,7 @@ import sys
 import time
 from pathlib import Path
 
-HOME = Path(os.environ.get("GRAPH_HOME", "~/.claude/graph")).expanduser()
+HOME = Path(os.environ.get("GRAPH_HOME") or Path(__file__).resolve().parents[2] / "graph")
 SPECS = HOME / "specs"
 ACTIVE = HOME / "active"
 PENDING = HOME / "pending.json"
@@ -77,7 +77,7 @@ def injection(spec, state, header):
     later = [t for t in spec["tasks"] if t["id"] not in done and t not in nxt]
     parts = [header]
     if not nxt and not later:
-        parts.append("Graph finished. Every task passed. Report to the user in a few lines.")
+        parts.append("Graph finished. Run `graph.py report <session>` and show the user the table, the decisions and what is still open.")
         return "\n\n".join(parts)
     current = nxt[0] if nxt else None
     if current:
@@ -93,6 +93,8 @@ def injection(spec, state, header):
         "Graph rules:\n"
         + rules_text(spec)
         + "\n- Only stop with a line starting with WAITING: (CI/build/deploy), DECISION: (question for the user) or BLOCKED: (real blocker)."
+        + "\n- Every choice the user did not explicitly ask for: record it right away with `graph.py decide <session> \"<decision>\"`."
+        + "\n- When the graph ends or you stop with BLOCKED:, run `graph.py report <session>` and show the table, the decisions and what is still open."
     )
     return "\n\n".join(parts)
 
@@ -146,6 +148,55 @@ def cmd_status(args):
         st = load(f)
         spec = load(str(f).replace(".state.json", ".json"))
         print(f"{spec['name']}: {len(st['done'])}/{len(spec['tasks'])} done, current {st.get('current')}")
+
+
+def spec_of_session(session):
+    active = active_for(session)
+    if not active:
+        sys.exit("no active graph in this session")
+    spec_path = Path(active["spec"])
+    sp = state_path(spec_path)
+    state = load(sp) if sp.exists() else {"done": [], "nudges": {}, "log": []}
+    return load(spec_path), sp, state
+
+
+def cmd_decide(args):
+    if len(args) < 2:
+        sys.exit("usage: graph.py decide <session> \"<decision>\"")
+    spec, sp, state = spec_of_session(args[0])
+    state.setdefault("decisions", []).append(
+        {"task": state.get("current"), "text": " ".join(args[1:]), "at": time.time()}
+    )
+    save(sp, state)
+    print("decision recorded")
+
+
+def cmd_report(args):
+    spec, _, state = spec_of_session(args[0] if args else "")
+    done = set(state["done"])
+    last = {}
+    for entry in state.get("log", []):
+        last[entry["id"]] = entry["result"]
+    rows = ["| Task | Result | Check |", "|---|---|---|"]
+    for t in spec["tasks"]:
+        if t["id"] in done:
+            result = "done"
+        elif last.get(t["id"]) == "falhou":
+            result = "**failed its check**"
+        elif all(d in done for d in t.get("depends_on", [])):
+            result = "**open**"
+        else:
+            result = "waiting on " + ", ".join(d for d in t.get("depends_on", []) if d not in done)
+        check = "; ".join(f"`{c[:60]}`" for c in t.get("done_when", [])) or "manual"
+        rows.append(f"| [{t['id']}] {t['title']} | {result} | {check} |")
+    print(f"## {spec['name']}: {len(done)}/{len(spec['tasks'])} tasks\n")
+    print("\n".join(rows))
+    decisions = state.get("decisions", [])
+    print("\n### Decisions taken without an explicit ask")
+    print("\n".join(f"- {d['text']}" if d['text'].startswith('[') else f"- [{d.get('task') or '-'}] {d['text']}" for d in decisions) or "- none recorded")
+    pending = [t for t in spec["tasks"] if t["id"] not in done]
+    print("\n### Still open")
+    print("\n".join(f"- [{t['id']}] {t['title']}" for t in pending) or "- nothing")
 
 
 def cmd_stop(args):
@@ -278,6 +329,8 @@ COMMANDS = {
     "start": cmd_start,
     "status": cmd_status,
     "stop": cmd_stop,
+    "decide": cmd_decide,
+    "report": cmd_report,
     "hook-task-completed": hook_task_completed,
     "hook-task-update": hook_task_update,
     "hook-stop": hook_stop,
@@ -286,7 +339,7 @@ COMMANDS = {
 
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
-        sys.exit("usage: graph.py start <spec.json> [session] | status | stop [session]")
+        sys.exit("usage: graph.py start <spec.json> [session] | status | stop [session] | decide <session> <text> | report [session]")
     try:
         COMMANDS[sys.argv[1]](sys.argv[2:])
     except SystemExit:
